@@ -3,10 +3,14 @@
 import {
   finalizeEvent,
   getPublicKey,
-  nip19,
   type Event as NostrEvent,
 } from "nostr-tools";
+import { hasStoredKey, parseSecretKey, removeStoredKey, saveKey, unlockKey } from "./keyStore";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+
+const RELAY_URL = (import.meta.env.VITE_RELAY_URL as string | undefined) ?? "wss://buzz.indra.network";
+
+type AuthMode = "loading" | "setup" | "locked" | "unlocked";
 
 type ConnectionStatus = "disconnected" | "connecting" | "authenticating" | "connected" | "error";
 
@@ -64,41 +68,6 @@ function hasTag(event: NostrEvent, name: string) {
   return event.tags.some((tag) => tag[0] === name);
 }
 
-function parseSecretKey(value: string): Uint8Array {
-  const trimmed = value.trim();
-  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-    return Uint8Array.from(trimmed.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)));
-  }
-
-  if (trimmed.startsWith("nsec1")) {
-    const decoded = nip19.decode(trimmed);
-    if (decoded.type === "nsec") return decoded.data;
-  }
-
-  throw new Error("개인키는 64자리 hex 또는 nsec 형식이어야 합니다.");
-}
-
-function normalizeRelayUrl(value: string) {
-  let candidate = value.trim();
-  if (!candidate) throw new Error("Buzz relay 주소를 입력해 주세요.");
-  if (!/^[a-z]+:\/\//i.test(candidate)) {
-    candidate = /^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(candidate) ? `ws://${candidate}` : `wss://${candidate}`;
-  }
-  if (candidate.startsWith("https://")) candidate = `wss://${candidate.slice(8)}`;
-  if (candidate.startsWith("http://")) candidate = `ws://${candidate.slice(7)}`;
-
-  const url = new URL(candidate);
-  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-    throw new Error("relay 주소는 ws:// 또는 wss:// 형식이어야 합니다.");
-  }
-  if (typeof window !== "undefined" && window.location.protocol === "https:" && url.protocol === "ws:") {
-    throw new Error("HTTPS 페이지에서는 보안 연결(wss://) relay만 사용할 수 있습니다.");
-  }
-  url.hash = "";
-  url.search = "";
-  return url.toString().replace(/\/$/, "");
-}
-
 function relayHttpUrl(relayUrl: string) {
   return relayUrl.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
 }
@@ -154,9 +123,12 @@ function nowInSeconds() {
 
 export default function Home() {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
-  const [relayInput, setRelayInput] = useState("wss://");
+  const [authMode, setAuthMode] = useState<AuthMode>("loading");
   const [secretInput, setSecretInput] = useState("");
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passwordConfirm, setPasswordConfirm] = useState("");
   const [showSecret, setShowSecret] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -275,7 +247,11 @@ export default function Home() {
       sendFrame(["REQ", channelSub, { kinds: [39000], limit: 500 }]);
       requestProfile(pubkeyRef.current);
       setStatus("connected");
+      setAuthMode("unlocked");
+      setAuthBusy(false);
       setSecretInput("");
+      setPasswordInput("");
+      setPasswordConfirm("");
       return;
     }
 
@@ -363,51 +339,97 @@ export default function Home() {
     }
   };
 
-  const connect = (event: FormEvent) => {
-    event.preventDefault();
+  const connect = (key: Uint8Array) => {
     setError("");
     setNotice("");
-    let relayUrl: string;
-    let key: Uint8Array;
-    try {
-      relayUrl = normalizeRelayUrl(relayInput);
-      key = parseSecretKey(secretInput);
-    } catch (validationError) {
-      setError(validationError instanceof Error ? validationError.message : "입력값을 확인해 주세요.");
-      setStatus("error");
-      return;
-    }
-
+    setAuthBusy(true);
     setStatus("connecting");
     secretRef.current = key;
     const pubkey = getPublicKey(key);
     pubkeyRef.current = pubkey;
-    relayRef.current = relayUrl;
+    relayRef.current = RELAY_URL;
     setOwnPubkey(pubkey);
-    setConnectedRelay(relayUrl);
-    setRelayInput(relayUrl);
-    localStorage.setItem("buzz-web-relay", relayUrl);
+    setConnectedRelay(RELAY_URL);
 
-    const socket = new WebSocket(relayUrl);
+    const socket = new WebSocket(RELAY_URL);
     socketRef.current = socket;
     socket.addEventListener("message", handleRelayMessage);
     socket.addEventListener("open", () => {
       authTimerRef.current = setTimeout(() => {
         setError("relay가 인증 요청을 보내지 않았습니다. Buzz relay 주소인지 확인해 주세요.");
         setStatus("error");
+        setAuthBusy(false);
         socket.close();
       }, 10000);
     });
     socket.addEventListener("error", () => {
       setError("relay에 연결할 수 없습니다. 주소와 TLS 설정을 확인해 주세요.");
       setStatus("error");
+      setAuthBusy(false);
     });
     socket.addEventListener("close", () => {
       if (authTimerRef.current) clearTimeout(authTimerRef.current);
       setStatus((current) => current === "error" || current === "disconnected" ? current : "error");
       setError((current) => current || "relay 연결이 종료되었습니다. 다시 연결해 주세요.");
+      setAuthBusy(false);
     });
-    void fetchRelayInfo(relayUrl);
+    void fetchRelayInfo(RELAY_URL);
+  };
+
+  const handleSetup = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    if (passwordInput.length < 4) {
+      setError("비밀번호는 4자 이상으로 정해 주세요.");
+      return;
+    }
+    if (passwordInput !== passwordConfirm) {
+      setError("비밀번호가 일치하지 않습니다.");
+      return;
+    }
+    let key: Uint8Array;
+    try {
+      key = parseSecretKey(secretInput);
+    } catch (validationError) {
+      setError(validationError instanceof Error ? validationError.message : "개인키를 확인해 주세요.");
+      return;
+    }
+    try {
+      await saveKey(key, passwordInput);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "키를 저장하지 못했습니다.");
+      return;
+    }
+    setSecretInput("");
+    setPasswordInput("");
+    setPasswordConfirm("");
+    connect(key);
+  };
+
+  const handleLogin = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    setAuthBusy(true);
+    try {
+      const key = await unlockKey(passwordInput);
+      setPasswordInput("");
+      connect(key);
+    } catch {
+      setError("비밀번호가 올바르지 않습니다.");
+      setAuthBusy(false);
+      return;
+    }
+  };
+
+  const lock = () => {
+    disconnect();
+    setAuthMode("locked");
+  };
+
+  const removeAccount = () => {
+    removeStoredKey();
+    disconnect();
+    setAuthMode("setup");
   };
 
   const disconnect = () => {
@@ -504,9 +526,9 @@ export default function Home() {
   };
 
   useEffect(() => {
-    const savedRelay = localStorage.getItem("buzz-web-relay");
-    if (savedRelay) window.setTimeout(() => setRelayInput(savedRelay), 0);
+    const timer = window.setTimeout(() => setAuthMode(hasStoredKey() ? "locked" : "setup"), 0);
     return () => {
+      window.clearTimeout(timer);
       socketRef.current?.close();
       secretRef.current?.fill(0);
       if (authTimerRef.current) clearTimeout(authTimerRef.current);
@@ -562,7 +584,7 @@ export default function Home() {
           <span className="note-icon">↗</span>
           <div><strong>브라우저에서 바로</strong><p>설치 없이 Buzz에 연결했어요.</p></div>
         </div>
-        {isConnected && <button className="disconnect-button" onClick={disconnect}>relay 연결 해제</button>}
+        {isConnected && <button className="disconnect-button" onClick={lock}>잠금</button>}
       </aside>
 
       {drawerOpen && <button className="drawer-backdrop" aria-label="채널 메뉴 닫기" onClick={() => setDrawerOpen(false)} />}
@@ -683,28 +705,52 @@ export default function Home() {
         </div>
       </section>
 
-      {!isConnected && (
+      {(authMode === "setup" || authMode === "locked") && (
         <div className="connect-layer">
-          <form className="connect-card" onSubmit={connect}>
-            <div className="connect-brand"><span>B</span><div><strong>Buzz Web</strong><small>TABLET CLIENT</small></div></div>
-            <div className="connect-copy">
-              <span className="beta-label">EARLY MVP</span>
-              <h2>내 Buzz에 연결하기</h2>
-              <p>앱 설치 없이 브라우저에서 채널을 읽고 메시지를 보내세요.</p>
-            </div>
+          {authMode === "setup" ? (
+            <form className="connect-card" onSubmit={handleSetup}>
+              <div className="connect-brand"><span>B</span><div><strong>Buzz Web</strong><small>TABLET CLIENT</small></div></div>
+              <div className="connect-copy">
+                <span className="beta-label">FIRST TIME SETUP</span>
+                <h2>이 기기에 계정 추가</h2>
+                <p>개인키는 비밀번호로 암호화해 이 브라우저에만 저장됩니다. 서버에는 저장되지 않아요.</p>
+              </div>
 
-            <label className="field-label" htmlFor="relay-url">Buzz relay 주소</label>
-            <div className="field-shell"><span className="field-icon">◎</span><input id="relay-url" value={relayInput} onChange={(event) => setRelayInput(event.target.value)} placeholder="wss://buzz.example.com" autoCapitalize="none" autoCorrect="off" spellCheck={false} /></div>
+              <div className="key-label-row"><label className="field-label" htmlFor="private-key">Nostr 개인키</label><span>평문 저장 안 함</span></div>
+              <div className="field-shell"><span className="field-icon key">◇</span><input id="private-key" type={showSecret ? "text" : "password"} value={secretInput} onChange={(event) => setSecretInput(event.target.value)} placeholder="nsec1… 또는 64자리 hex" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button type="button" className="reveal-key" onClick={() => setShowSecret((value) => !value)}>{showSecret ? "숨김" : "보기"}</button></div>
 
-            <div className="key-label-row"><label className="field-label" htmlFor="private-key">Nostr 개인키</label><span>서버에 저장하지 않음</span></div>
-            <div className="field-shell"><span className="field-icon key">◇</span><input id="private-key" type={showSecret ? "text" : "password"} value={secretInput} onChange={(event) => setSecretInput(event.target.value)} placeholder="nsec1… 또는 64자리 hex" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button type="button" className="reveal-key" onClick={() => setShowSecret((value) => !value)}>{showSecret ? "숨김" : "보기"}</button></div>
+              <label className="field-label" htmlFor="new-password">비밀번호</label>
+              <div className="field-shell"><span className="field-icon">◈</span><input id="new-password" type="password" value={passwordInput} onChange={(event) => setPasswordInput(event.target.value)} placeholder="키를 잠글 비밀번호" autoComplete="new-password" /></div>
 
-            {error && <div className="connect-error" role="alert"><span>!</span>{error}</div>}
-            <button className="connect-button" type="submit" disabled={status === "connecting" || status === "authenticating"}>
-              {status === "connecting" || status === "authenticating" ? <><i /> {connectionLabel}</> : <>relay에 연결 <span>→</span></>}
-            </button>
-            <p className="connect-footnote"><span>●</span> 개인키는 이 탭의 메모리에서 NIP-42 인증과 메시지 서명에만 사용됩니다.</p>
-          </form>
+              <label className="field-label" htmlFor="password-confirm">비밀번호 확인</label>
+              <div className="field-shell"><span className="field-icon">◈</span><input id="password-confirm" type="password" value={passwordConfirm} onChange={(event) => setPasswordConfirm(event.target.value)} placeholder="비밀번호 다시 입력" autoComplete="new-password" /></div>
+
+              {error && <div className="connect-error" role="alert"><span>!</span>{error}</div>}
+              <button className="connect-button" type="submit" disabled={authBusy || status === "connecting" || status === "authenticating"}>
+                {authBusy || status === "connecting" || status === "authenticating" ? <><i /> {connectionLabel}</> : <>계정 저장하고 들어가기 <span>→</span></>}
+              </button>
+              <p className="connect-footnote"><span>●</span> 개인키는 브라우저에서 PBKDF2 + AES-GCM으로 암호화되며, 복호화는 이 기기에서만 일어납니다.</p>
+            </form>
+          ) : (
+            <form className="connect-card" onSubmit={handleLogin}>
+              <div className="connect-brand"><span>B</span><div><strong>Buzz Web</strong><small>TABLET CLIENT</small></div></div>
+              <div className="connect-copy">
+                <span className="beta-label">BUZZ</span>
+                <h2>들어가기</h2>
+                <p>{new URL(RELAY_URL).hostname}</p>
+              </div>
+
+              <label className="field-label" htmlFor="login-password">비밀번호</label>
+              <div className="field-shell"><span className="field-icon">◈</span><input id="login-password" type="password" value={passwordInput} onChange={(event) => setPasswordInput(event.target.value)} placeholder="비밀번호 입력" autoComplete="current-password" ref={(input) => input?.focus()} /></div>
+
+              {error && <div className="connect-error" role="alert"><span>!</span>{error}</div>}
+              <button className="connect-button" type="submit" disabled={authBusy || status === "connecting" || status === "authenticating"}>
+                {authBusy || status === "connecting" || status === "authenticating" ? <><i /> {connectionLabel}</> : <>들어가기 <span>→</span></>}
+              </button>
+              <button type="button" className="remove-account-button" onClick={removeAccount}>이 기기에서 계정 삭제</button>
+              <p className="connect-footnote"><span>●</span> 비밀번호는 이 기기에서 키를 복호화하는 데만 사용됩니다.</p>
+            </form>
+          )}
         </div>
       )}
 
