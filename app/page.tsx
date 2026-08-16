@@ -24,11 +24,19 @@ type Profile = {
   isAgent?: boolean;
 };
 
+type Reaction = {
+  id: string;
+  emoji: string;
+  pubkey: string;
+};
+
 type RelayInfo = {
   name?: string;
   description?: string;
   icon?: string;
 };
+
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "🎉", "👀"];
 
 const DEMO_CHANNELS: Channel[] = [
   { id: "demo-general", name: "general", about: "팀 전체가 함께 이야기하는 공간", isPrivate: false, createdAt: 3 },
@@ -162,6 +170,9 @@ export default function Home() {
   const [composer, setComposer] = useState("");
   const [sending, setSending] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
+  const [replyTo, setReplyTo] = useState<NostrEvent | null>(null);
+  const [pickerFor, setPickerFor] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -171,6 +182,7 @@ export default function Home() {
   const channelSubRef = useRef("");
   const messageSubRef = useRef("");
   const memberSubRef = useRef("");
+  const reactionSubRef = useRef("");
   const profileSubRefs = useRef(new Map<string, string>());
   const requestedProfilesRef = useRef(new Set<string>());
   const authTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -203,20 +215,27 @@ export default function Home() {
     try {
       if (messageSubRef.current) sendFrame(["CLOSE", messageSubRef.current]);
       if (memberSubRef.current) sendFrame(["CLOSE", memberSubRef.current]);
+      if (reactionSubRef.current) sendFrame(["CLOSE", reactionSubRef.current]);
     } catch {
       // The old connection may already be gone.
     }
 
     const messageSub = nextSubscription("messages");
     const memberSub = nextSubscription("members");
+    const reactionSub = nextSubscription("reactions");
     messageSubRef.current = messageSub;
     memberSubRef.current = memberSub;
+    reactionSubRef.current = reactionSub;
     setActiveChannel(channel);
     setMessages([]);
     setMemberCount(0);
+    setReactions({});
+    setReplyTo(null);
+    setPickerFor("");
     setDrawerOpen(false);
     sendFrame(["REQ", messageSub, { kinds: [9, 40002], "#h": [channel.id], limit: 200 }]);
     sendFrame(["REQ", memberSub, { kinds: [39002], "#d": [channel.id], limit: 1 }]);
+    sendFrame(["REQ", reactionSub, { kinds: [7], "#h": [channel.id], limit: 300 }]);
   };
 
   const fetchRelayInfo = async (relayUrl: string) => {
@@ -277,6 +296,15 @@ export default function Home() {
           return [...current, event].sort((a, b) => a.created_at - b.created_at);
         });
         requestProfile(event.pubkey);
+      } else if (event.kind === 7 && idOrChallenge === reactionSubRef.current) {
+        const target = findTag(event, "e");
+        const emoji = event.content.trim();
+        if (!target || !emoji) return;
+        setReactions((current) => {
+          const list = current[target] ?? [];
+          if (list.some((item) => item.id === event.id)) return current;
+          return { ...current, [target]: [...list, { id: event.id, emoji, pubkey: event.pubkey }] };
+        });
       } else if (event.kind === 39002 && idOrChallenge === memberSubRef.current) {
         setMemberCount(event.tags.filter((tag) => tag[0] === "p").length);
       } else if (event.kind === 0) {
@@ -397,6 +425,9 @@ export default function Home() {
     setProfiles({});
     setActiveChannel(null);
     setRelayInfo({});
+    setReactions({});
+    setReplyTo(null);
+    setPickerFor("");
     setNotice("");
     setError("");
   };
@@ -407,20 +438,61 @@ export default function Home() {
     if (!content || !key || !activeChannel || sending) return;
 
     try {
+      const tags: string[][] = [["h", activeChannel.id]];
+      if (replyTo) tags.push(["e", replyTo.id, "", "reply"]);
       const event = finalizeEvent({
         kind: 9,
         created_at: nowInSeconds(),
         content,
-        tags: [["h", activeChannel.id]],
+        tags,
       }, key);
       setSending(true);
       setComposer("");
+      setReplyTo(null);
       setMessages((current) => [...current, event].sort((a, b) => a.created_at - b.created_at));
       sendFrame(["EVENT", event]);
       window.setTimeout(() => setSending(false), 5000);
     } catch (sendError) {
       setNotice(sendError instanceof Error ? sendError.message : "메시지를 보내지 못했습니다.");
       setSending(false);
+    }
+  };
+
+  const toggleReaction = (targetId: string, emoji: string) => {
+    const key = secretRef.current;
+    if (!key || !activeChannel || sending) return;
+    setPickerFor("");
+
+    const own = (reactions[targetId] ?? []).find((item) => item.pubkey === pubkeyRef.current && item.emoji === emoji);
+    try {
+      if (own) {
+        const deletion = finalizeEvent({
+          kind: 5,
+          created_at: nowInSeconds(),
+          content: "",
+          tags: [["e", own.id]],
+        }, key);
+        sendFrame(["EVENT", deletion]);
+        setReactions((current) => ({
+          ...current,
+          [targetId]: (current[targetId] ?? []).filter((item) => item.id !== own.id),
+        }));
+        return;
+      }
+
+      const reaction = finalizeEvent({
+        kind: 7,
+        created_at: nowInSeconds(),
+        content: emoji,
+        tags: [["e", targetId], ["h", activeChannel.id]],
+      }, key);
+      sendFrame(["EVENT", reaction]);
+      setReactions((current) => ({
+        ...current,
+        [targetId]: [...(current[targetId] ?? []), { id: reaction.id, emoji, pubkey: pubkeyRef.current }],
+      }));
+    } catch (reactionError) {
+      setNotice(reactionError instanceof Error ? reactionError.message : "반응을 보내지 못했습니다.");
     }
   };
 
@@ -519,6 +591,13 @@ export default function Home() {
           {visibleMessages.map((message) => {
             const profile = visibleProfiles[message.pubkey];
             const name = profile?.name || shortPubkey(message.pubkey);
+            const replyTargetId = findTag(message, "e");
+            const parent = replyTargetId ? messages.find((item) => item.id === replyTargetId) : undefined;
+            const parentName = parent ? (profiles[parent.pubkey]?.name || shortPubkey(parent.pubkey)) : null;
+            const grouped = new Map<string, string[]>();
+            for (const item of reactions[message.id] ?? []) {
+              grouped.set(item.emoji, [...(grouped.get(item.emoji) ?? []), item.pubkey]);
+            }
             return (
               <article className="message" key={message.id}>
                 {profile?.picture ? (
@@ -528,8 +607,46 @@ export default function Home() {
                 ) : <div className={`message-avatar ${avatarTone(message.pubkey)}`}>{initials(name)}</div>}
                 <div className="message-body">
                   <div className="message-meta"><strong>{name}</strong>{profile?.isAgent && <span className="agent-badge">AGENT</span>}<time>{formatTime(message.created_at)}</time></div>
+                  {replyTargetId && (
+                    <p className="reply-context">↩ {parentName ? `${parentName}: ${messageText(parent.content).slice(0, 80)}` : shortPubkey(replyTargetId)}</p>
+                  )}
                   <p>{messageText(message.content)}</p>
+                  {(grouped.size > 0 || (isConnected && activeChannel)) && (
+                    <div className="reaction-row">
+                      {[...grouped.entries()].map(([emoji, pubkeys]) => (
+                        <button
+                          key={emoji}
+                          className={`reaction-chip ${pubkeys.includes(ownPubkey) ? "own" : ""}`}
+                          disabled={!isConnected || !activeChannel}
+                          onClick={() => toggleReaction(message.id, emoji)}
+                        >
+                          {emoji} {pubkeys.length}
+                        </button>
+                      ))}
+                      {isConnected && activeChannel && (
+                        <button
+                          className={`reaction-add ${pickerFor === message.id ? "open" : ""}`}
+                          aria-label="반응 추가"
+                          disabled={sending}
+                          onClick={() => setPickerFor((current) => (current === message.id ? "" : message.id))}
+                        >＋</button>
+                      )}
+                    </div>
+                  )}
+                  {pickerFor === message.id && (
+                    <div className="reaction-picker" role="menu">
+                      {REACTION_EMOJIS.map((emoji) => (
+                        <button key={emoji} onClick={() => toggleReaction(message.id, emoji)} aria-label={`반응 ${emoji}`}>{emoji}</button>
+                      ))}
+                    </div>
+                  )}
                 </div>
+                {isConnected && activeChannel && (
+                  <div className="message-actions">
+                    <button aria-label="답장" onClick={() => setReplyTo(message)}>↩</button>
+                    <button aria-label="반응" onClick={() => setPickerFor((current) => (current === message.id ? "" : message.id))}>☺</button>
+                  </div>
+                )}
               </article>
             );
           })}
@@ -538,6 +655,16 @@ export default function Home() {
         </div>
 
         <div className="composer-wrap">
+          {replyTo && (
+            <div className="reply-bar">
+              <span className="reply-arrow">↩</span>
+              <div className="reply-preview">
+                <strong>{visibleProfiles[replyTo.pubkey]?.name || shortPubkey(replyTo.pubkey)}</strong>
+                <p>{messageText(replyTo.content).slice(0, 90) || "빈 메시지"}</p>
+              </div>
+              <button aria-label="답장 취소" onClick={() => setReplyTo(null)}>×</button>
+            </div>
+          )}
           <div className={`composer ${!isConnected || !activeChannel ? "disabled" : ""}`}>
             <span className="composer-plus">＋</span>
             <textarea
