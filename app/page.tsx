@@ -6,6 +6,8 @@ import {
   type Event as NostrEvent,
 } from "nostr-tools";
 import { hasStoredKey, parseSecretKey, removeStoredKey, saveKey, unlockKey } from "./keyStore";
+import { resolveMentions, segmentMentions } from "./mentions";
+import type { Profile } from "./profiles";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
 const RELAY_URL = (import.meta.env.VITE_RELAY_URL as string | undefined) ?? "wss://buzz.indra.network";
@@ -20,12 +22,6 @@ type Channel = {
   about: string;
   isPrivate: boolean;
   createdAt: number;
-};
-
-type Profile = {
-  name: string;
-  picture?: string;
-  isAgent?: boolean;
 };
 
 type Reaction = {
@@ -145,6 +141,7 @@ export default function Home() {
   const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
   const [replyTo, setReplyTo] = useState<NostrEvent | null>(null);
   const [pickerFor, setPickerFor] = useState("");
+  const [memberPubkeys, setMemberPubkeys] = useState<string[]>([]);
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -169,6 +166,15 @@ export default function Home() {
 
   const ownProfile = profiles[ownPubkey];
   const ownName = ownProfile?.name || shortPubkey(ownPubkey || "TH");
+
+  const memberProfiles = useMemo(() => {
+    const map: Record<string, Profile> = {};
+    for (const pubkey of memberPubkeys) {
+      const profile = profiles[pubkey];
+      if (profile) map[pubkey] = profile;
+    }
+    return map;
+  }, [memberPubkeys, profiles]);
 
   const sendFrame = (frame: unknown[]) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) throw new Error("relay 연결이 끊겼습니다.");
@@ -201,6 +207,7 @@ export default function Home() {
     setActiveChannel(channel);
     setMessages([]);
     setMemberCount(0);
+    setMemberPubkeys([]);
     setReactions({});
     setReplyTo(null);
     setPickerFor("");
@@ -282,7 +289,10 @@ export default function Home() {
           return { ...current, [target]: [...list, { id: event.id, emoji, pubkey: event.pubkey }] };
         });
       } else if (event.kind === 39002 && idOrChallenge === memberSubRef.current) {
-        setMemberCount(event.tags.filter((tag) => tag[0] === "p").length);
+        const pubkeys = event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]).filter(Boolean);
+        setMemberCount(pubkeys.length);
+        setMemberPubkeys(pubkeys);
+        for (const pubkey of pubkeys) requestProfile(pubkey);
       } else if (event.kind === 0) {
         try {
           const metadata = JSON.parse(event.content);
@@ -444,6 +454,7 @@ export default function Home() {
     setConnectedRelay("");
     setChannels([]);
     setMessages([]);
+    setMemberPubkeys([]);
     setProfiles({});
     setActiveChannel(null);
     setRelayInfo({});
@@ -462,6 +473,7 @@ export default function Home() {
     try {
       const tags: string[][] = [["h", activeChannel.id]];
       if (replyTo) tags.push(["e", replyTo.id, "", "reply"]);
+      for (const pubkey of resolveMentions(content, memberProfiles)) tags.push(["p", pubkey]);
       const event = finalizeEvent({
         kind: 9,
         created_at: nowInSeconds(),
@@ -632,7 +644,9 @@ export default function Home() {
                   {replyTargetId && (
                     <p className="reply-context">↩ {parentName ? `${parentName}: ${messageText(parent.content).slice(0, 80)}` : shortPubkey(replyTargetId)}</p>
                   )}
-                  <p>{messageText(message.content)}</p>
+                  <p>{segmentMentions(messageText(message.content), memberProfiles).map((segment, index) => (
+                    segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
+                  ))}</p>
                   {(grouped.size > 0 || (isConnected && activeChannel)) && (
                     <div className="reaction-row">
                       {[...grouped.entries()].map(([emoji, pubkeys]) => (
