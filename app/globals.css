@@ -190,6 +190,15 @@ button { color:inherit; }
 .members-add input { width:100%; border:0; outline:0; font-size:12px; }
 .connect-button.small { padding:9px; font-size:12px; }
 .members-hint { margin:0; color:var(--muted); font-size:10.5px; line-height:1.5; }
+.nav-add-button { margin-left:auto; width:20px; height:20px; border:0; border-radius:6px; background:transparent; color:#8c7070; font-size:13px; cursor:pointer; }
+.nav-add-button:hover { background:#f2eaea; }
+.modal-layer { position:absolute; z-index:50; inset:0; display:grid; place-items:center; }
+.modal-layer .drawer-backdrop { display:block; position:absolute; inset:0; }
+.create-card { position:relative; z-index:1; width:min(360px,88vw); }
+.create-card .field-shell { border:1px solid var(--line); border-radius:10px; padding:9px 12px; }
+.create-card .field-shell input { width:100%; border:0; outline:0; font-size:13px; }
+.create-card .field-label { display:block; margin:12px 0 5px; }
+.checkbox-row { display:flex; align-items:center; gap:8px; margin:14px 0 4px; font-size:12.5px; color:var(--ink); cursor:pointer; }
 .app-shell:has(.members-panel) { grid-template-columns:72px 252px minmax(0,1fr) minmax(280px,340px); }
 .app-shell:has(.members-panel):has(.thread-panel) { grid-template-columns:72px 252px minmax(0,1fr) minmax(280px,340px) minmax(280px,340px); }
 @media (max-width:780px) {

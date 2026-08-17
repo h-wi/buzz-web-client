@@ -161,6 +161,10 @@ export default function Home() {
   const [mentionState, setMentionState] = useState<{ field: "main" | "thread"; query: string } | null>(null);
   const [membersOpen, setMembersOpen] = useState(false);
   const [addMemberInput, setAddMemberInput] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createAbout, setCreateAbout] = useState("");
+  const [createPrivate, setCreatePrivate] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -305,6 +309,47 @@ export default function Home() {
       setNotice(`${profiles[target]?.name || shortPubkey(target)} 제거 요청을 보냈어요.`);
     } catch {
       setNotice("멤버 제거 이벤트를 만들지 못했어요.");
+    }
+  };
+
+  const createChannel = () => {
+    const key = secretRef.current;
+    const name = createName.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (!key) return;
+    if (!name) {
+      setNotice("채널 이름을 입력해 주세요 (영문 소문자/숫자/하이픈).");
+      return;
+    }
+    try {
+      const channelId = crypto.randomUUID();
+      const tags: string[][] = [
+        ["h", channelId],
+        ["name", name],
+        ["visibility", createPrivate ? "private" : "open"],
+        ["channel_type", "stream"],
+      ];
+      if (createAbout.trim()) tags.push(["about", createAbout.trim()]);
+      const event = finalizeEvent({
+        kind: 9007,
+        created_at: nowInSeconds(),
+        content: "",
+        tags,
+      }, key);
+      sendFrame(["EVENT", event]);
+      setChannels((current) => [...current, {
+        id: channelId,
+        name,
+        about: createAbout.trim() || "새 채널",
+        isPrivate: createPrivate,
+        createdAt: nowInSeconds(),
+      }].sort((a, b) => a.name.localeCompare(b.name)));
+      setCreateOpen(false);
+      setCreateName("");
+      setCreateAbout("");
+      setCreatePrivate(false);
+      setNotice(`#${name} 채널을 만들었어요.`);
+    } catch {
+      setNotice("채널 생성 이벤트를 만들지 못했어요.");
     }
   };
 
@@ -790,7 +835,7 @@ export default function Home() {
           <span className={`status-pill ${status}`}><i /> {connectionLabel}</span>
         </div>
         <nav className="channel-nav" aria-label="채널">
-          <p className="nav-label">CHANNELS <span>{visibleChannels.length}</span></p>
+          <p className="nav-label">CHANNELS <span>{visibleChannels.length}</span>{isConnected && <button className="nav-add-button" aria-label="채널 추가" onClick={() => setCreateOpen(true)}>＋</button>}</p>
           {visibleChannels.map((channel) => (
             <button
               key={channel.id}
@@ -986,6 +1031,27 @@ export default function Home() {
           <p className="security-note"><span>◇</span> 메시지는 연결한 Buzz relay에만 저장됩니다.</p>
         </div>
       </section>
+
+      {createOpen && (
+        <div className="modal-layer" role="dialog" aria-label="채널 만들기">
+          <button className="drawer-backdrop" aria-label="닫기" onClick={() => setCreateOpen(false)} />
+          <form className="connect-card create-card" onSubmit={(event) => { event.preventDefault(); createChannel(); }}>
+            <div className="connect-copy">
+              <span className="beta-label">NEW CHANNEL</span>
+              <h2>채널 만들기</h2>
+            </div>
+            <label className="field-label" htmlFor="channel-name">이름 (영문 소문자/숫자/하이픈)</label>
+            <div className="field-shell"><input id="channel-name" value={createName} autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="예: project-alpha" onChange={(event) => setCreateName(event.target.value)} /></div>
+            <label className="field-label" htmlFor="channel-about">설명 (선택)</label>
+            <div className="field-shell"><input id="channel-about" value={createAbout} placeholder="이 채널의 용도" onChange={(event) => setCreateAbout(event.target.value)} /></div>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={createPrivate} onChange={(event) => setCreatePrivate(event.target.checked)} />
+              비공개 채널
+            </label>
+            <button className="connect-button" type="submit" disabled={!createName.trim()}>채널 만들기 <span>→</span></button>
+          </form>
+        </div>
+      )}
 
       {membersOpen && isConnected && activeChannel && (
         <section className="members-panel" aria-label="채널 멤버">
