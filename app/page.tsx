@@ -142,6 +142,9 @@ export default function Home() {
   const [replyTo, setReplyTo] = useState<NostrEvent | null>(null);
   const [pickerFor, setPickerFor] = useState("");
   const [memberPubkeys, setMemberPubkeys] = useState<string[]>([]);
+  const [openThreadId, setOpenThreadId] = useState("");
+  const [threadComposer, setThreadComposer] = useState("");
+  const [threadTarget, setThreadTarget] = useState<NostrEvent | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -175,6 +178,25 @@ export default function Home() {
     }
     return map;
   }, [memberPubkeys, profiles]);
+
+  const messagesById = useMemo(() => {
+    const map = new Map<string, NostrEvent>();
+    for (const message of visibleMessages) map.set(message.id, message);
+    return map;
+  }, [visibleMessages]);
+
+  const repliesByRoot = useMemo(() => {
+    const map = new Map<string, NostrEvent[]>();
+    for (const message of visibleMessages) {
+      const rootId = findTag(message, "e");
+      if (!rootId || !messagesById.has(rootId)) continue;
+      map.set(rootId, [...(map.get(rootId) ?? []), message]);
+    }
+    return map;
+  }, [visibleMessages, messagesById]);
+
+  const openThread = openThreadId ? messagesById.get(openThreadId) ?? null : null;
+  const openThreadReplies = openThreadId ? repliesByRoot.get(openThreadId) ?? [] : [];
 
   const sendFrame = (frame: unknown[]) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) throw new Error("relay 연결이 끊겼습니다.");
@@ -211,6 +233,9 @@ export default function Home() {
     setReactions({});
     setReplyTo(null);
     setPickerFor("");
+    setOpenThreadId("");
+    setThreadComposer("");
+    setThreadTarget(null);
     setDrawerOpen(false);
     sendFrame(["REQ", messageSub, { kinds: [9, 40002], "#h": [channel.id], limit: 200 }]);
     sendFrame(["REQ", memberSub, { kinds: [39002], "#d": [channel.id], limit: 1 }]);
@@ -460,19 +485,21 @@ export default function Home() {
     setRelayInfo({});
     setReactions({});
     setReplyTo(null);
+    setOpenThreadId("");
+    setThreadComposer("");
+    setThreadTarget(null);
     setPickerFor("");
     setNotice("");
     setError("");
   };
 
-  const sendMessage = () => {
-    const content = composer.trim();
+  const publishMessage = (content: string, parentEvent: NostrEvent | null) => {
     const key = secretRef.current;
     if (!content || !key || !activeChannel || sending) return;
 
     try {
       const tags: string[][] = [["h", activeChannel.id]];
-      if (replyTo) tags.push(["e", replyTo.id, "", "reply"]);
+      if (parentEvent) tags.push(["e", parentEvent.id, "", "reply"]);
       for (const pubkey of resolveMentions(content, memberProfiles)) tags.push(["p", pubkey]);
       const event = finalizeEvent({
         kind: 9,
@@ -481,15 +508,30 @@ export default function Home() {
         tags,
       }, key);
       setSending(true);
-      setComposer("");
-      setReplyTo(null);
       setMessages((current) => [...current, event].sort((a, b) => a.created_at - b.created_at));
       sendFrame(["EVENT", event]);
       window.setTimeout(() => setSending(false), 5000);
+      return true;
     } catch (sendError) {
       setNotice(sendError instanceof Error ? sendError.message : "메시지를 보내지 못했습니다.");
       setSending(false);
+      return false;
     }
+  };
+
+  const sendMessage = () => {
+    const content = composer.trim();
+    if (!content) return;
+    if (publishMessage(content, replyTo)) {
+      setComposer("");
+      setReplyTo(null);
+    }
+  };
+
+  const sendThreadMessage = () => {
+    const content = threadComposer.trim();
+    if (!content || !openThread) return;
+    if (publishMessage(content, threadTarget ?? openThread)) setThreadComposer("");
   };
 
   const toggleReaction = (targetId: string, emoji: string) => {
@@ -626,8 +668,10 @@ export default function Home() {
             const profile = visibleProfiles[message.pubkey];
             const name = profile?.name || shortPubkey(message.pubkey);
             const replyTargetId = findTag(message, "e");
-            const parent = replyTargetId ? messages.find((item) => item.id === replyTargetId) : undefined;
+            if (replyTargetId && messagesById.has(replyTargetId)) return null;
+            const parent = replyTargetId ? messagesById.get(replyTargetId) : undefined;
             const parentName = parent ? (profiles[parent.pubkey]?.name || shortPubkey(parent.pubkey)) : null;
+            const threadReplies = repliesByRoot.get(message.id) ?? [];
             const grouped = new Map<string, string[]>();
             for (const item of reactions[message.id] ?? []) {
               grouped.set(item.emoji, [...(grouped.get(item.emoji) ?? []), item.pubkey]);
@@ -676,9 +720,26 @@ export default function Home() {
                       ))}
                     </div>
                   )}
+                  {threadReplies.length > 0 && (
+                    <button
+                      className={`thread-indicator ${openThreadId === message.id ? "active" : ""}`}
+                      onClick={() => {
+                        setOpenThreadId(message.id);
+                        setThreadTarget(null);
+                      }}
+                    >
+                      <span className="thread-avatars">
+                        {[...new Set(threadReplies.map((item) => item.pubkey))].slice(0, 3).map((pubkey) => (
+                          <span key={pubkey} className={`thread-avatar ${avatarTone(pubkey)}`}>{initials(visibleProfiles[pubkey]?.name || shortPubkey(pubkey))}</span>
+                        ))}
+                      </span>
+                      답글 {threadReplies.length}개
+                    </button>
+                  )}
                 </div>
                 {isConnected && activeChannel && (
                   <div className="message-actions">
+                    <button aria-label="스레드 열기" onClick={() => { setOpenThreadId(message.id); setThreadTarget(null); }}>💬</button>
                     <button aria-label="답장" onClick={() => setReplyTo(message)}>↩</button>
                     <button aria-label="반응" onClick={() => setPickerFor((current) => (current === message.id ? "" : message.id))}>☺</button>
                   </div>
@@ -718,6 +779,87 @@ export default function Home() {
           <p className="security-note"><span>◇</span> 메시지는 연결한 Buzz relay에만 저장됩니다.</p>
         </div>
       </section>
+
+      {openThread && (
+        <section className="thread-panel" aria-label="스레드">
+          <header className="thread-header">
+            <button className="thread-close" aria-label="스레드 닫기" onClick={() => setOpenThreadId("")}>×</button>
+            <div>
+              <span className="eyebrow">THREAD</span>
+              <h3>#{visibleActive?.name || "channel"}의 스레드</h3>
+            </div>
+          </header>
+
+          <div className="thread-scroll">
+            <div
+              className={`thread-message root ${threadTarget?.id === openThread.id || !threadTarget ? "focused" : ""}`}
+              role="button" tabIndex={0}
+              onClick={() => setThreadTarget(openThread)}
+              onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setThreadTarget(openThread); }}
+            >
+              <div className={`message-avatar ${avatarTone(openThread.pubkey)}`}>{initials(visibleProfiles[openThread.pubkey]?.name || shortPubkey(openThread.pubkey))}</div>
+              <div className="message-body">
+                <div className="message-meta"><strong>{visibleProfiles[openThread.pubkey]?.name || shortPubkey(openThread.pubkey)}</strong><time>{formatTime(openThread.created_at)}</time></div>
+                <p>{segmentMentions(messageText(openThread.content), memberProfiles).map((segment, index) => (
+                  segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
+                ))}</p>
+              </div>
+            </div>
+
+            {openThreadReplies.length > 0 && <div className="thread-divider"><span>{openThreadReplies.length}개 답글</span></div>}
+
+            {openThreadReplies.map((reply) => (
+              <div
+                key={reply.id}
+                className={`thread-message ${threadTarget?.id === reply.id ? "focused" : ""}`}
+                role="button" tabIndex={0}
+                onClick={() => setThreadTarget(reply)}
+                onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setThreadTarget(reply); }}
+              >
+                <div className={`message-avatar ${avatarTone(reply.pubkey)}`}>{initials(visibleProfiles[reply.pubkey]?.name || shortPubkey(reply.pubkey))}</div>
+                <div className="message-body">
+                  <div className="message-meta"><strong>{visibleProfiles[reply.pubkey]?.name || shortPubkey(reply.pubkey)}</strong>{visibleProfiles[reply.pubkey]?.isAgent && <span className="agent-badge">AGENT</span>}<time>{formatTime(reply.created_at)}</time></div>
+                  <p>{segmentMentions(messageText(reply.content), memberProfiles).map((segment, index) => (
+                    segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
+                  ))}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="thread-composer-wrap">
+            {threadTarget && threadTarget.id !== openThread.id && (
+              <div className="reply-bar">
+                <span className="reply-arrow">↩</span>
+                <div className="reply-preview">
+                  <strong>{visibleProfiles[threadTarget.pubkey]?.name || shortPubkey(threadTarget.pubkey)}</strong>
+                  <p>{messageText(threadTarget.content).slice(0, 90) || "빈 메시지"}</p>
+                </div>
+                <button aria-label="답장 대상 초기화" onClick={() => setThreadTarget(openThread)}>↺</button>
+              </div>
+            )}
+            <div className={`composer ${!isConnected || !activeChannel ? "disabled" : ""}`}>
+              <textarea
+                aria-label="스레드 답글"
+                placeholder="스레드에 답글 달기"
+                rows={1}
+                value={threadComposer}
+                disabled={!isConnected || !activeChannel}
+                onChange={(event) => setThreadComposer(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    sendThreadMessage();
+                  }
+                  if (event.key === "Escape") setOpenThreadId("");
+                }}
+              />
+              <span className="composer-hint">Shift + Enter</span>
+              <button className="send-button" aria-label="답글 보내기" disabled={!threadComposer.trim() || sending || !isConnected} onClick={sendThreadMessage}>↑</button>
+            </div>
+          </div>
+        </section>
+      )}
 
       {(authMode === "setup" || authMode === "locked") && (
         <div className="connect-layer">
