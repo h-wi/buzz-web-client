@@ -167,6 +167,7 @@ export default function Home() {
   const [createPrivate, setCreatePrivate] = useState(false);
   const [agentDirectory, setAgentDirectory] = useState<{ pubkey: string; name: string }[]>([]);
   const [showAgentPicker, setShowAgentPicker] = useState(false);
+  const [agentSearch, setAgentSearch] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -1119,7 +1120,19 @@ export default function Home() {
                 </button>
                 {showAgentPicker && (
                   <div className="agent-picker-list">
-                    {agentDirectory.map((agent) => {
+                    <div className="field-shell agent-search">
+                      <input
+                        aria-label="에이전트 검색"
+                        value={agentSearch}
+                        placeholder="이름으로 검색"
+                        autoCapitalize="none" autoCorrect="off" spellCheck={false}
+                        onChange={(event) => setAgentSearch(event.target.value)}
+                      />
+                    </div>
+                    {agentDirectory
+                      .map((agent) => ({ ...agent, displayName: profiles[agent.pubkey]?.name || agent.name }))
+                      .filter((agent) => !agentSearch.trim() || agent.displayName.toLowerCase().includes(agentSearch.trim().toLowerCase()))
+                      .map((agent) => {
                       const already = memberPubkeys.includes(agent.pubkey);
                       return (
                         <button
@@ -1138,14 +1151,14 @@ export default function Home() {
                               }, key);
                               sendFrame(["EVENT", invite]);
                               setMemberPubkeys((current) => [...current, agent.pubkey]);
-                              setNotice(`${agent.name} 초대를 보냈어요.`);
+                              setNotice(`${agent.displayName} 초대를 보냈어요.`);
                             } catch {
                               setNotice("초대 이벤트를 만들지 못했어요.");
                             }
                           }}
                         >
-                          <span className={`message-avatar ${avatarTone(agent.pubkey)}`}>{initials(agent.name)}</span>
-                          <span className="mention-candidate-name">{agent.name}</span>
+                          <span className={`message-avatar ${avatarTone(agent.pubkey)}`}>{initials(agent.displayName)}</span>
+                          <span className="mention-candidate-name">{agent.displayName}</span>
                           {already ? <span className="member-you">멤버</span> : <span className="agent-add">＋ 추가</span>}
                         </button>
                       );
