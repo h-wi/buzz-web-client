@@ -3,6 +3,7 @@
 import {
   finalizeEvent,
   getPublicKey,
+  nip19,
   type Event as NostrEvent,
 } from "nostr-tools";
 import { hasStoredKey, parseSecretKey, removeStoredKey, saveKey, unlockKey } from "./keyStore";
@@ -157,6 +158,9 @@ export default function Home() {
   const [openThreadId, setOpenThreadId] = useState("");
   const [threadComposer, setThreadComposer] = useState("");
   const [threadTarget, setThreadTarget] = useState<NostrEvent | null>(null);
+  const [mentionState, setMentionState] = useState<{ field: "main" | "thread"; query: string } | null>(null);
+  const [membersOpen, setMembersOpen] = useState(false);
+  const [addMemberInput, setAddMemberInput] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -221,6 +225,90 @@ export default function Home() {
   const openThread = openThreadId ? messagesById.get(openThreadId) ?? null : null;
   const openThreadReplies = openThreadId ? repliesByRoot.get(openThreadId) ?? [] : [];
 
+  const mentionCandidates = useMemo(() => {
+    return memberPubkeys
+      .filter((pubkey) => pubkey !== ownPubkey && profiles[pubkey])
+      .map((pubkey) => ({ pubkey, profile: profiles[pubkey] }))
+      .filter((item) => !mentionState?.query || item.profile.name.toLowerCase().includes(mentionState.query.toLowerCase()))
+      .sort((a, b) => (a.profile.isAgent === b.profile.isAgent ? a.profile.name.localeCompare(b.profile.name) : a.profile.isAgent ? -1 : 1))
+      .slice(0, 8);
+  }, [memberPubkeys, profiles, ownPubkey, mentionState]);
+
+  const updateMentionState = (field: "main" | "thread", value: string, caret: number) => {
+    const before = value.slice(0, caret);
+    const match = /(^|\s)@([\w.-]*)$/.exec(before);
+    setMentionState(match ? { field, query: match[2] } : null);
+  };
+
+  const insertMention = (candidate: { pubkey: string; profile: Profile }) => {
+    if (!mentionState) return;
+    const setter = mentionState.field === "main" ? setComposer : setThreadComposer;
+    setter((current) => current.replace(/(^|\s)(@[\w.-]*)$/, (_, prefix) => `${prefix}@${candidate.profile.name} `));
+    setMentionState(null);
+  };
+
+  const parsePubkeyInput = (value: string): string | null => {
+    const trimmed = value.trim();
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) return trimmed.toLowerCase();
+    if (trimmed.startsWith("npub1")) {
+      try {
+        const decoded = nip19.decode(trimmed);
+        if (decoded.type === "npub") return decoded.data;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const addMemberToChannel = () => {
+    const key = secretRef.current;
+    const target = parsePubkeyInput(addMemberInput);
+    if (!key || !activeChannel) return;
+    if (!target) {
+      setNotice("npub 또는 64자리 hex 공개키를 입력해 주세요.");
+      return;
+    }
+    if (memberPubkeys.includes(target)) {
+      setNotice("이미 채널 멤버예요.");
+      return;
+    }
+    try {
+      const event = finalizeEvent({
+        kind: 9000,
+        created_at: nowInSeconds(),
+        content: "",
+        tags: [["h", activeChannel.id], ["p", target], ["role", "member"]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setAddMemberInput("");
+      setMemberPubkeys((current) => [...current, target]);
+      setNotice(`${profiles[target]?.name || shortPubkey(target)} 멤버 추가 요청을 보냈어요.`);
+      requestProfile(target);
+    } catch {
+      setNotice("멤버 추가 이벤트를 만들지 못했어요.");
+    }
+  };
+
+  const removeMemberFromChannel = (target: string) => {
+    const key = secretRef.current;
+    if (!key || !activeChannel || target === ownPubkey) return;
+    try {
+      const event = finalizeEvent({
+        kind: 9001,
+        created_at: nowInSeconds(),
+        content: "",
+        tags: [["h", activeChannel.id], ["p", target]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setMemberPubkeys((current) => current.filter((pubkey) => pubkey !== target));
+      setNotice(`${profiles[target]?.name || shortPubkey(target)} 제거 요청을 보냈어요.`);
+    } catch {
+      setNotice("멤버 제거 이벤트를 만들지 못했어요.");
+    }
+  };
+
+
   const sendFrame = (frame: unknown[]) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) throw new Error("relay 연결이 끊겼습니다.");
     socketRef.current.send(JSON.stringify(frame));
@@ -259,6 +347,8 @@ export default function Home() {
     setOpenThreadId("");
     setThreadComposer("");
     setThreadTarget(null);
+    setMentionState(null);
+    setMembersOpen(false);
     setDrawerOpen(false);
     sendFrame(["REQ", messageSub, { kinds: [9, 40002], "#h": [channel.id], limit: 200 }]);
     sendFrame(["REQ", memberSub, { kinds: [39002], "#d": [channel.id], limit: 1 }]);
@@ -745,7 +835,7 @@ export default function Home() {
           </div>
           <div className="header-actions">
             {isConnected && <span className="member-count"><i className="member-dot one" /><i className="member-dot two" /><i className="member-dot three" /> {memberCount || "—"}</span>}
-            <button aria-label="채널 정보" onClick={() => setNotice(visibleActive?.id || "채널 정보가 없습니다.")}>•••</button>
+            <button aria-label="채널 멤버" onClick={() => setMembersOpen((value) => !value)}>•••</button>
           </div>
         </header>
 
@@ -866,15 +956,83 @@ export default function Home() {
               rows={1}
               value={composer}
               disabled={!isConnected || !activeChannel}
-              onChange={(event) => setComposer(event.target.value)}
-              onKeyDown={handleComposerKey}
+              onChange={(event) => { setComposer(event.target.value); updateMentionState("main", event.target.value, event.target.selectionStart ?? event.target.value.length); }}
+              onKeyDown={(event) => {
+                if (mentionState && mentionCandidates.length) {
+                  if (event.key === "Escape") { setMentionState(null); return; }
+                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    insertMention(mentionCandidates[0]);
+                    return;
+                  }
+                }
+                handleComposerKey(event);
+              }}
             />
+            {mentionState?.field === "main" && mentionCandidates.length > 0 && (
+              <div className="mention-popup" role="listbox">
+                {mentionCandidates.map((candidate) => (
+                  <button key={candidate.pubkey} role="option" aria-selected={false} onClick={() => insertMention(candidate)}>
+                    <span className={`message-avatar ${avatarTone(candidate.pubkey)}`}>{initials(candidate.profile.name)}</span>
+                    <span className="mention-candidate-name">{candidate.profile.name}</span>
+                    {candidate.profile.isAgent && <span className="agent-badge">AGENT</span>}
+                  </button>
+                ))}
+              </div>
+            )}
             <span className="composer-hint">Shift + Enter</span>
             <button className="send-button" aria-label="메시지 보내기" disabled={!composer.trim() || sending || !isConnected} onClick={sendMessage}>↑</button>
           </div>
           <p className="security-note"><span>◇</span> 메시지는 연결한 Buzz relay에만 저장됩니다.</p>
         </div>
       </section>
+
+      {membersOpen && isConnected && activeChannel && (
+        <section className="members-panel" aria-label="채널 멤버">
+          <header className="thread-header">
+            <button className="thread-close" aria-label="멤버 패널 닫기" onClick={() => setMembersOpen(false)}>×</button>
+            <div>
+              <span className="eyebrow">MEMBERS</span>
+              <h3>{memberPubkeys.length}명 · {visibleActive?.name}</h3>
+            </div>
+          </header>
+          <div className="members-list">
+            {memberPubkeys.map((pubkey) => (
+              <div key={pubkey} className="member-row">
+                {profiles[pubkey]?.picture ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img className="message-avatar image" src={profiles[pubkey].picture} alt="" />
+                ) : <div className={`message-avatar ${avatarTone(pubkey)}`}>{initials(profiles[pubkey]?.name || shortPubkey(pubkey))}</div>}
+                <span className="mention-candidate-name">{profiles[pubkey]?.name || shortPubkey(pubkey)}</span>
+                {profiles[pubkey]?.isAgent && <span className="agent-badge">AGENT</span>}
+                {pubkey === ownPubkey ? (
+                  <span className="member-you">나</span>
+                ) : (
+                  <div className="member-row-actions">
+                    <button aria-label="DM 보내기" disabled={dmBusy} onClick={() => openDm(pubkey)}>✉</button>
+                    <button aria-label="멤버 제거" onClick={() => removeMemberFromChannel(pubkey)}>✕</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="members-add">
+            <label className="field-label" htmlFor="add-member">멤버 추가 (에이전트 포함)</label>
+            <div className="field-shell">
+              <input
+                id="add-member"
+                value={addMemberInput}
+                placeholder="npub1… 또는 hex 공개키"
+                autoCapitalize="none" autoCorrect="off" spellCheck={false}
+                onChange={(event) => setAddMemberInput(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") addMemberToChannel(); }}
+              />
+            </div>
+            <button className="connect-button small" onClick={addMemberToChannel} disabled={!addMemberInput.trim()}>추가</button>
+            <p className="members-hint">에이전트 공개키는 Buzz 앱의 프로필에서 확인하거나, 멤버 목록의 에이전트를 다른 채널에서 ✉/복사로 가져올 수 있어요.</p>
+          </div>
+        </section>
+      )}
 
       {openThread && (
         <section className="thread-panel" aria-label="스레드">
@@ -941,8 +1099,16 @@ export default function Home() {
                 rows={1}
                 value={threadComposer}
                 disabled={!isConnected || !activeChannel}
-                onChange={(event) => setThreadComposer(event.target.value)}
+                onChange={(event) => { setThreadComposer(event.target.value); updateMentionState("thread", event.target.value, event.target.selectionStart ?? event.target.value.length); }}
                 onKeyDown={(event) => {
+                  if (mentionState && mentionCandidates.length) {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      insertMention(mentionCandidates[0]);
+                      return;
+                    }
+                    if (event.key === "Escape") { setMentionState(null); return; }
+                  }
                   if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                     event.preventDefault();
                     sendThreadMessage();
@@ -950,6 +1116,17 @@ export default function Home() {
                   if (event.key === "Escape") setOpenThreadId("");
                 }}
               />
+              {mentionState?.field === "thread" && mentionCandidates.length > 0 && (
+                <div className="mention-popup" role="listbox">
+                  {mentionCandidates.map((candidate) => (
+                    <button key={candidate.pubkey} role="option" aria-selected={false} onClick={() => insertMention(candidate)}>
+                      <span className={`message-avatar ${avatarTone(candidate.pubkey)}`}>{initials(candidate.profile.name)}</span>
+                      <span className="mention-candidate-name">{candidate.profile.name}</span>
+                      {candidate.profile.isAgent && <span className="agent-badge">AGENT</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
               <span className="composer-hint">Shift + Enter</span>
               <button className="send-button" aria-label="답글 보내기" disabled={!threadComposer.trim() || sending || !isConnected} onClick={sendThreadMessage}>↑</button>
             </div>
