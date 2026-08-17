@@ -184,6 +184,8 @@ export default function Home() {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const dmListSubRef = useRef("");
   const agentDirSubRef = useRef("");
+  const archivedSubRef = useRef("");
+  const archivedRef = useRef<Set<string>>(new Set());
   const dmOpenCallbackRef = useRef<((reason: string, accepted: boolean) => void) | null>(null);
 
   const isConnected = status === "connected";
@@ -407,7 +409,16 @@ export default function Home() {
   const fetchRelayInfo = async (relayUrl: string) => {
     try {
       const response = await fetch(relayHttpUrl(relayUrl), { headers: { Accept: "application/nostr+json" } });
-      if (response.ok) setRelayInfo(await response.json());
+      if (response.ok) {
+        const info = await response.json();
+        setRelayInfo(info);
+        const selfPubkey = typeof info.self === "string" ? info.self.replace(/^npub1/, (match) => match && "") : "";
+        if (selfPubkey && /^[0-9a-fA-F]{64}$/.test(selfPubkey)) {
+          const archivedSub = nextSubscription("archived");
+          archivedSubRef.current = archivedSub;
+          sendFrame(["REQ", archivedSub, { kinds: [13535], authors: [selfPubkey.toLowerCase()], limit: 1 }]);
+        }
+      }
     } catch {
       // Relay metadata is optional; WebSocket chat can still work without it.
     }
@@ -497,9 +508,13 @@ export default function Home() {
           return [...current.filter((item) => item.id !== dm.id), dm].sort((a, b) => b.createdAt - a.createdAt);
         });
         for (const pubkey of participants) requestProfile(pubkey);
+      } else if (event.kind === 13535 && idOrChallenge === archivedSubRef.current) {
+        const archived = event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]).filter(Boolean);
+        archivedRef.current = new Set(archived);
+        setAgentDirectory((current) => current.filter((agent) => !archived.includes(agent.pubkey)));
       } else if (event.kind === 30177 && idOrChallenge === agentDirSubRef.current) {
         const agentPubkey = findTag(event, "d");
-        if (!agentPubkey) return;
+        if (!agentPubkey || archivedRef.current.has(agentPubkey)) return;
         let name = "";
         try {
           name = JSON.parse(event.content).display_name || JSON.parse(event.content).name || "";
@@ -541,6 +556,8 @@ export default function Home() {
       } else if (idOrChallenge === dmListSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
       } else if (idOrChallenge === agentDirSubRef.current) {
+        sendFrame(["CLOSE", idOrChallenge]);
+      } else if (idOrChallenge === archivedSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
       } else if (profileSubRefs.current.has(idOrChallenge)) {
         sendFrame(["CLOSE", idOrChallenge]);
@@ -683,6 +700,8 @@ export default function Home() {
     setConnectedRelay("");
     setChannels([]);
     setDms([]);
+    setAgentDirectory([]);
+    archivedRef.current = new Set();
     setMessages([]);
     setMemberPubkeys([]);
     setProfiles({});
