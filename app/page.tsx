@@ -165,6 +165,8 @@ export default function Home() {
   const [createName, setCreateName] = useState("");
   const [createAbout, setCreateAbout] = useState("");
   const [createPrivate, setCreatePrivate] = useState(false);
+  const [agentDirectory, setAgentDirectory] = useState<{ pubkey: string; name: string }[]>([]);
+  const [showAgentPicker, setShowAgentPicker] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -180,6 +182,7 @@ export default function Home() {
   const authTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const dmListSubRef = useRef("");
+  const agentDirSubRef = useRef("");
   const dmOpenCallbackRef = useRef<((reason: string, accepted: boolean) => void) | null>(null);
 
   const isConnected = status === "connected";
@@ -438,6 +441,9 @@ export default function Home() {
       const dmSub = nextSubscription("dmlist");
       dmListSubRef.current = dmSub;
       sendFrame(["REQ", dmSub, { kinds: [41001], "#p": [pubkeyRef.current], limit: 50 }]);
+      const agentSub = nextSubscription("agents");
+      agentDirSubRef.current = agentSub;
+      sendFrame(["REQ", agentSub, { kinds: [30177], authors: [pubkeyRef.current], limit: 200 }]);
       requestProfile(pubkeyRef.current);
       setStatus("connected");
       setAuthMode("unlocked");
@@ -490,6 +496,22 @@ export default function Home() {
           return [...current.filter((item) => item.id !== dm.id), dm].sort((a, b) => b.createdAt - a.createdAt);
         });
         for (const pubkey of participants) requestProfile(pubkey);
+      } else if (event.kind === 30177 && idOrChallenge === agentDirSubRef.current) {
+        const agentPubkey = findTag(event, "d");
+        if (!agentPubkey) return;
+        let name = "";
+        try {
+          name = JSON.parse(event.content).display_name || JSON.parse(event.content).name || "";
+        } catch {
+          // Name falls back to the pubkey.
+        }
+        setAgentDirectory((current) => {
+          const existing = current.find((item) => item.pubkey === agentPubkey);
+          const entry = { pubkey: agentPubkey, name: name || shortPubkey(agentPubkey) };
+          if (existing) return current.map((item) => (item.pubkey === agentPubkey ? entry : item));
+          return [...current, entry];
+        });
+        requestProfile(agentPubkey);
       } else if (event.kind === 0) {
         try {
           const metadata = JSON.parse(event.content);
@@ -516,6 +538,8 @@ export default function Home() {
           return current;
         });
       } else if (idOrChallenge === dmListSubRef.current) {
+        sendFrame(["CLOSE", idOrChallenge]);
+      } else if (idOrChallenge === agentDirSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
       } else if (profileSubRefs.current.has(idOrChallenge)) {
         sendFrame(["CLOSE", idOrChallenge]);
@@ -1083,6 +1107,53 @@ export default function Home() {
             ))}
           </div>
           <div className="members-add">
+            {agentDirectory.length > 0 && (
+              <div className="agent-picker">
+                <p className="field-label">내 에이전트에서 추가</p>
+                <button
+                  type="button"
+                  className={`agent-picker-toggle ${showAgentPicker ? "open" : ""}`}
+                  onClick={() => setShowAgentPicker((value) => !value)}
+                >
+                  🤖 에이전트 선택 ({agentDirectory.filter((item) => !memberPubkeys.includes(item.pubkey)).length})
+                </button>
+                {showAgentPicker && (
+                  <div className="agent-picker-list">
+                    {agentDirectory.map((agent) => {
+                      const already = memberPubkeys.includes(agent.pubkey);
+                      return (
+                        <button
+                          key={agent.pubkey}
+                          type="button"
+                          disabled={already}
+                          onClick={() => {
+                            const key = secretRef.current;
+                            if (!key || !activeChannel) return;
+                            try {
+                              const invite = finalizeEvent({
+                                kind: 9000,
+                                created_at: nowInSeconds(),
+                                content: "",
+                                tags: [["h", activeChannel.id], ["p", agent.pubkey], ["role", "member"]],
+                              }, key);
+                              sendFrame(["EVENT", invite]);
+                              setMemberPubkeys((current) => [...current, agent.pubkey]);
+                              setNotice(`${agent.name} 초대를 보냈어요.`);
+                            } catch {
+                              setNotice("초대 이벤트를 만들지 못했어요.");
+                            }
+                          }}
+                        >
+                          <span className={`message-avatar ${avatarTone(agent.pubkey)}`}>{initials(agent.name)}</span>
+                          <span className="mention-candidate-name">{agent.name}</span>
+                          {already ? <span className="member-you">멤버</span> : <span className="agent-add">＋ 추가</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
             <label className="field-label" htmlFor="add-member">멤버 추가 (에이전트 포함)</label>
             <div className="field-shell">
               <input
@@ -1095,7 +1166,7 @@ export default function Home() {
               />
             </div>
             <button className="connect-button small" onClick={addMemberToChannel} disabled={!addMemberInput.trim()}>추가</button>
-            <p className="members-hint">에이전트 공개키는 Buzz 앱의 프로필에서 확인하거나, 멤버 목록의 에이전트를 다른 채널에서 ✉/복사로 가져올 수 있어요.</p>
+            <p className="members-hint">공개키로도 추가할 수 있어요: npub1… 또는 64자리 hex.</p>
           </div>
         </section>
       )}
