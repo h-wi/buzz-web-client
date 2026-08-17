@@ -22,6 +22,8 @@ type Channel = {
   about: string;
   isPrivate: boolean;
   createdAt: number;
+  isDm?: boolean;
+  participants?: string[];
 };
 
 type Reaction = {
@@ -106,7 +108,15 @@ function avatarTone(value: string) {
 }
 
 function formatTime(timestamp: number) {
-  return new Intl.DateTimeFormat("ko-KR", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Seoul" }).format(new Date(timestamp * 1000));
+  const date = new Date(timestamp * 1000);
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  return new Intl.DateTimeFormat("ko-KR", {
+    ...(sameDay ? {} : { month: "numeric", day: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "Asia/Seoul",
+  }).format(date);
 }
 
 function nextSubscription(prefix: string) {
@@ -142,6 +152,8 @@ export default function Home() {
   const [replyTo, setReplyTo] = useState<NostrEvent | null>(null);
   const [pickerFor, setPickerFor] = useState("");
   const [memberPubkeys, setMemberPubkeys] = useState<string[]>([]);
+  const [dms, setDms] = useState<Channel[]>([]);
+  const [dmBusy, setDmBusy] = useState(false);
   const [openThreadId, setOpenThreadId] = useState("");
   const [threadComposer, setThreadComposer] = useState("");
   const [threadTarget, setThreadTarget] = useState<NostrEvent | null>(null);
@@ -159,13 +171,24 @@ export default function Home() {
   const requestedProfilesRef = useRef(new Set<string>());
   const authTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const dmListSubRef = useRef("");
+  const dmOpenCallbackRef = useRef<((reason: string, accepted: boolean) => void) | null>(null);
 
   const isConnected = status === "connected";
   const visibleChannels = isConnected ? channels : DEMO_CHANNELS;
+  const dmNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const dm of dms) {
+      const others = (dm.participants ?? []).filter((pubkey) => pubkey !== ownPubkey);
+      map.set(dm.id, others.map((pubkey) => profiles[pubkey]?.name || shortPubkey(pubkey)).join(", ") || "나");
+    }
+    return map;
+  }, [dms, profiles, ownPubkey]);
   const visibleMessages = isConnected ? messages : DEMO_MESSAGES;
   const visibleProfiles = isConnected ? profiles : DEMO_PROFILES;
   const visibleActive = isConnected ? activeChannel : DEMO_CHANNELS[0];
   const workspaceName = relayInfo.name || (connectedRelay ? new URL(connectedRelay).hostname : "My Buzz");
+  const activeHeadingName = visibleActive?.isDm ? (dmNames.get(visibleActive.id) || "DM") : visibleActive?.name;
 
   const ownProfile = profiles[ownPubkey];
   const ownName = ownProfile?.name || shortPubkey(ownPubkey || "TH");
@@ -277,6 +300,9 @@ export default function Home() {
       const channelSub = nextSubscription("channels");
       channelSubRef.current = channelSub;
       sendFrame(["REQ", channelSub, { kinds: [39000], limit: 500 }]);
+      const dmSub = nextSubscription("dmlist");
+      dmListSubRef.current = dmSub;
+      sendFrame(["REQ", dmSub, { kinds: [41001], "#p": [pubkeyRef.current], limit: 50 }]);
       requestProfile(pubkeyRef.current);
       setStatus("connected");
       setAuthMode("unlocked");
@@ -318,6 +344,17 @@ export default function Home() {
         setMemberCount(pubkeys.length);
         setMemberPubkeys(pubkeys);
         for (const pubkey of pubkeys) requestProfile(pubkey);
+      } else if (event.kind === 41001 && idOrChallenge === dmListSubRef.current) {
+        const dmId = findTag(event, "d");
+        if (!dmId) return;
+        const participants = [event.pubkey, ...event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1])].filter((pubkey, index, all) => pubkey && all.indexOf(pubkey) === index);
+        const dm: Channel = { id: dmId, name: "", about: "다이렉트 메시지", isPrivate: true, isDm: true, createdAt: event.created_at, participants };
+        setDms((current) => {
+          const existing = current.find((item) => item.id === dm.id);
+          if (existing && existing.createdAt > dm.createdAt) return current;
+          return [...current.filter((item) => item.id !== dm.id), dm].sort((a, b) => b.createdAt - a.createdAt);
+        });
+        for (const pubkey of participants) requestProfile(pubkey);
       } else if (event.kind === 0) {
         try {
           const metadata = JSON.parse(event.content);
@@ -343,6 +380,8 @@ export default function Home() {
           if (current.length && !activeChannel) queueMicrotask(() => subscribeToChannel(current[0]));
           return current;
         });
+      } else if (idOrChallenge === dmListSubRef.current) {
+        sendFrame(["CLOSE", idOrChallenge]);
       } else if (profileSubRefs.current.has(idOrChallenge)) {
         sendFrame(["CLOSE", idOrChallenge]);
         profileSubRefs.current.delete(idOrChallenge);
@@ -353,10 +392,15 @@ export default function Home() {
     if (type === "OK" && typeof idOrChallenge === "string") {
       const accepted = payload === true;
       const reason = typeof frame[3] === "string" ? frame[3] : "";
+      const dmCallback = dmOpenCallbackRef.current;
+      if (dmCallback) {
+        dmOpenCallbackRef.current = null;
+        dmCallback(reason, accepted);
+      }
       if (idOrChallenge === authEventIdRef.current && !accepted) {
         setError(reason || "relay가 인증을 거부했습니다.");
         setStatus("error");
-      } else if (!accepted) {
+      } else if (!accepted && !dmCallback) {
         setNotice(reason || "메시지를 보낼 수 없습니다.");
       }
       setSending(false);
@@ -478,6 +522,7 @@ export default function Home() {
     setOwnPubkey("");
     setConnectedRelay("");
     setChannels([]);
+    setDms([]);
     setMessages([]);
     setMemberPubkeys([]);
     setProfiles({});
@@ -532,6 +577,40 @@ export default function Home() {
     const content = threadComposer.trim();
     if (!content || !openThread) return;
     if (publishMessage(content, threadTarget ?? openThread)) setThreadComposer("");
+  };
+
+  const openDm = (pubkey: string) => {
+    const key = secretRef.current;
+    if (!key || dmBusy || pubkey === ownPubkey) return;
+    requestProfile(pubkey);
+
+    const existing = dms.find((dm) => (dm.participants ?? []).includes(pubkey));
+    if (existing) {
+      subscribeToChannel(existing);
+      return;
+    }
+
+    setDmBusy(true);
+    const dmId = crypto.randomUUID();
+    const event = finalizeEvent({
+      kind: 41010,
+      created_at: nowInSeconds(),
+      content: "",
+      tags: [["p", pubkey], ["d", dmId]],
+    }, key);
+
+    dmOpenCallbackRef.current = (reason, accepted) => {
+      setDmBusy(false);
+      if (!accepted) {
+        setNotice(reason || "DM을 열 수 없습니다.");
+        return;
+      }
+      const relayId = reason.match(/"channel_id":"([^"]+)"/)?.[1] ?? dmId;
+      const dm: Channel = { id: relayId, name: "", about: "다이렉트 메시지", isPrivate: true, isDm: true, createdAt: nowInSeconds(), participants: [ownPubkey, pubkey] };
+      setDms((current) => (current.some((item) => item.id === dm.id) ? current : [dm, ...current]));
+      subscribeToChannel(dm);
+    };
+    sendFrame(["EVENT", event]);
   };
 
   const toggleReaction = (targetId: string, emoji: string) => {
@@ -634,6 +713,20 @@ export default function Home() {
           ))}
           {isConnected && channels.length === 0 && <p className="empty-channels">볼 수 있는 채널이 없습니다.</p>}
         </nav>
+        {isConnected && (
+          <nav className="channel-nav dm-nav" aria-label="다이렉트 메시지">
+            <p className="nav-label">DIRECT MESSAGES <span>{dms.length}</span></p>
+            {dms.map((dm) => (
+              <button
+                key={dm.id}
+                className={`channel-link dm ${visibleActive?.id === dm.id ? "active" : ""}`}
+                onClick={() => subscribeToChannel(dm)}
+              >
+                <span className="hash">✉</span><span className="channel-name">{dmNames.get(dm.id) || shortPubkey(dm.participants?.[0] ?? dm.id)}</span>
+              </button>
+            ))}
+          </nav>
+        )}
         <div className="sidebar-note">
           <span className="note-icon">↗</span>
           <div><strong>브라우저에서 바로</strong><p>설치 없이 Buzz에 연결했어요.</p></div>
@@ -647,7 +740,7 @@ export default function Home() {
         <header className="chat-header">
           <button className="mobile-menu" aria-label="채널 메뉴" onClick={() => setDrawerOpen(true)}><span /><span /><span /></button>
           <div className="channel-heading">
-            <h2><span>{visibleActive?.isPrivate ? "⌑" : "#"}</span> {visibleActive?.name || "채널을 선택하세요"}</h2>
+            <h2><span>{visibleActive?.isDm ? "✉" : visibleActive?.isPrivate ? "⌑" : "#"}</span> {activeHeadingName || "채널을 선택하세요"}</h2>
             <p>{visibleActive?.about || "연결한 relay의 채널이 여기에 표시됩니다."}</p>
           </div>
           <div className="header-actions">
@@ -659,7 +752,7 @@ export default function Home() {
         <div className="message-list">
           <div className="channel-intro">
             <div className="intro-hash">{visibleActive?.isPrivate ? "⌑" : "#"}</div>
-            <h3>{visibleActive?.name || "Buzz"}에 오신 걸 환영해요</h3>
+            <h3>{activeHeadingName || "Buzz"}에 오신 걸 환영해요</h3>
             <p>{visibleActive?.about || "사람과 에이전트가 같은 공간에서 함께 일해요."}</p>
           </div>
           <div className="date-rule"><span>최근 메시지</span></div>
@@ -741,6 +834,9 @@ export default function Home() {
                   <div className="message-actions">
                     <button aria-label="스레드 열기" onClick={() => { setOpenThreadId(message.id); setThreadTarget(null); }}>💬</button>
                     <button aria-label="답장" onClick={() => setReplyTo(message)}>↩</button>
+                    {isConnected && message.pubkey !== ownPubkey && (
+                      <button aria-label="DM 보내기" disabled={dmBusy} onClick={() => openDm(message.pubkey)}>✉</button>
+                    )}
                     <button aria-label="반응" onClick={() => setPickerFor((current) => (current === message.id ? "" : message.id))}>☺</button>
                   </div>
                 )}
@@ -766,7 +862,7 @@ export default function Home() {
             <span className="composer-plus">＋</span>
             <textarea
               aria-label="메시지"
-              placeholder={isConnected ? `#${activeChannel?.name || "channel"}에 메시지 보내기` : "relay에 연결하면 메시지를 보낼 수 있어요"}
+              placeholder={isConnected ? (activeChannel?.isDm ? `${activeHeadingName || "상대"}에게 메시지 보내기` : `#${activeChannel?.name || "channel"}에 메시지 보내기`) : "relay에 연결하면 메시지를 보낼 수 있어요"}
               rows={1}
               value={composer}
               disabled={!isConnected || !activeChannel}
@@ -786,7 +882,7 @@ export default function Home() {
             <button className="thread-close" aria-label="스레드 닫기" onClick={() => setOpenThreadId("")}>×</button>
             <div>
               <span className="eyebrow">THREAD</span>
-              <h3>#{visibleActive?.name || "channel"}의 스레드</h3>
+              <h3>{visibleActive?.isDm ? "" : "#"}{activeHeadingName || "channel"}의 스레드</h3>
             </div>
           </header>
 
