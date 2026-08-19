@@ -8,6 +8,7 @@ import {
 } from "nostr-tools";
 import { hasStoredKey, parseSecretKey, removeStoredKey, saveKey, unlockKey } from "./keyStore";
 import { resolveMentions, segmentMentions } from "./mentions";
+import { monotonicCreatedAt, parsePersona, parseTeam, personaContentBody, personaTags, teamContentBody, type Persona, type Team } from "./agents";
 import type { Profile } from "./profiles";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -168,6 +169,10 @@ export default function Home() {
   const [agentDirectory, setAgentDirectory] = useState<{ pubkey: string; name: string }[]>([]);
   const [showAgentPicker, setShowAgentPicker] = useState(false);
   const [agentSearch, setAgentSearch] = useState("");
+  const [personas, setPersonas] = useState<Persona[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [manageTab, setManageTab] = useState<"agents" | "groups">("agents");
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -184,6 +189,8 @@ export default function Home() {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const dmListSubRef = useRef("");
   const agentDirSubRef = useRef("");
+  const personaSubRef = useRef("");
+  const teamSubRef = useRef("");
   const archivedSubRef = useRef("");
   const archivedRef = useRef<Set<string>>(new Set());
   const dmOpenCallbackRef = useRef<((reason: string, accepted: boolean) => void) | null>(null);
@@ -359,6 +366,88 @@ export default function Home() {
     }
   };
 
+  const savePersona = (persona: Persona) => {
+    const key = secretRef.current;
+    if (!key) return;
+    try {
+      const event = finalizeEvent({
+        kind: 30175,
+        created_at: monotonicCreatedAt(persona.updatedAt),
+        content: personaContentBody(persona),
+        tags: personaTags(persona.slug, persona.shared),
+      }, key);
+      sendFrame(["EVENT", event]);
+      setPersonas((current) => {
+        const next = { ...persona, updatedAt: event.created_at };
+        return [...current.filter((item) => item.slug !== persona.slug), next].sort((a, b) => a.displayName.localeCompare(b.displayName));
+      });
+      setNotice(`${persona.displayName} 정의를 저장했어요.`);
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "정의를 저장하지 못했어요.");
+      return false;
+    }
+  };
+
+  const saveTeam = (team: Team) => {
+    const key = secretRef.current;
+    if (!key) return;
+    try {
+      const event = finalizeEvent({
+        kind: 30176,
+        created_at: monotonicCreatedAt(team.updatedAt),
+        content: teamContentBody(team),
+        tags: [["d", team.id]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setTeams((current) => {
+        const next = { ...team, updatedAt: event.created_at };
+        return [...current.filter((item) => item.id !== team.id), next].sort((a, b) => a.name.localeCompare(b.name));
+      });
+      setNotice(`${team.name} 그룹을 저장했어요.`);
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "그룹을 저장하지 못했어요.");
+      return false;
+    }
+  };
+
+  const deletePersona = (persona: Persona) => {
+    const key = secretRef.current;
+    if (!key) return;
+    try {
+      const event = finalizeEvent({
+        kind: 5,
+        created_at: monotonicCreatedAt(persona.updatedAt),
+        content: "",
+        tags: [["a", `30175:${pubkeyRef.current}:${persona.slug}`], ["k", "30175"]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setPersonas((current) => current.filter((item) => item.slug !== persona.slug));
+      setNotice(`${persona.displayName} 정의를 삭제했어요.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "정의를 삭제하지 못했어요.");
+    }
+  };
+
+  const deleteTeam = (team: Team) => {
+    const key = secretRef.current;
+    if (!key) return;
+    try {
+      const event = finalizeEvent({
+        kind: 5,
+        created_at: monotonicCreatedAt(team.updatedAt),
+        content: "",
+        tags: [["a", `30176:${pubkeyRef.current}:${team.id}`], ["k", "30176"]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setTeams((current) => current.filter((item) => item.id !== team.id));
+      setNotice(`${team.name} 그룹을 삭제했어요.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "그룹을 삭제하지 못했어요.");
+    }
+  };
+
 
   const sendFrame = (frame: unknown[]) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) throw new Error("relay 연결이 끊겼습니다.");
@@ -456,6 +545,12 @@ export default function Home() {
       const agentSub = nextSubscription("agents");
       agentDirSubRef.current = agentSub;
       sendFrame(["REQ", agentSub, { kinds: [30177], authors: [pubkeyRef.current], limit: 200 }]);
+      const personaSub = nextSubscription("personas");
+      personaSubRef.current = personaSub;
+      sendFrame(["REQ", personaSub, { kinds: [30175], authors: [pubkeyRef.current], limit: 200 }]);
+      const teamSub = nextSubscription("teams");
+      teamSubRef.current = teamSub;
+      sendFrame(["REQ", teamSub, { kinds: [30176], authors: [pubkeyRef.current], limit: 200 }]);
       requestProfile(pubkeyRef.current);
       setStatus("connected");
       setAuthMode("unlocked");
@@ -528,6 +623,22 @@ export default function Home() {
           return [...current, entry];
         });
         requestProfile(agentPubkey);
+      } else if (event.kind === 30175 && idOrChallenge === personaSubRef.current) {
+        const persona = parsePersona(event);
+        if (!persona) return;
+        setPersonas((current) => {
+          const existing = current.find((item) => item.slug === persona.slug);
+          if (existing && existing.updatedAt >= persona.updatedAt) return current;
+          return [...current.filter((item) => item.slug !== persona.slug), persona].sort((a, b) => a.displayName.localeCompare(b.displayName));
+        });
+      } else if (event.kind === 30176 && idOrChallenge === teamSubRef.current) {
+        const team = parseTeam(event);
+        if (!team) return;
+        setTeams((current) => {
+          const existing = current.find((item) => item.id === team.id);
+          if (existing && existing.updatedAt >= team.updatedAt) return current;
+          return [...current.filter((item) => item.id !== team.id), team].sort((a, b) => a.name.localeCompare(b.name));
+        });
       } else if (event.kind === 0) {
         try {
           const metadata = JSON.parse(event.content);
@@ -556,6 +667,10 @@ export default function Home() {
       } else if (idOrChallenge === dmListSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
       } else if (idOrChallenge === agentDirSubRef.current) {
+        sendFrame(["CLOSE", idOrChallenge]);
+      } else if (idOrChallenge === personaSubRef.current) {
+        sendFrame(["CLOSE", idOrChallenge]);
+      } else if (idOrChallenge === teamSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
       } else if (idOrChallenge === archivedSubRef.current) {
         sendFrame(["CLOSE", idOrChallenge]);
@@ -701,6 +816,8 @@ export default function Home() {
     setChannels([]);
     setDms([]);
     setAgentDirectory([]);
+    setPersonas([]);
+    setTeams([]);
     archivedRef.current = new Set();
     setMessages([]);
     setMemberPubkeys([]);
@@ -870,6 +987,9 @@ export default function Home() {
       <aside className="workspace-rail" aria-label="워크스페이스">
         <div className="brand-mark" aria-label="Buzz Web">B</div>
         <div className="rail-spacer" />
+        {isConnected && (
+          <button className="rail-manage-button" aria-label="에이전트 관리" title="에이전트·그룹 관리" onClick={() => setManageOpen(true)}>⚙</button>
+        )}
         <button className="avatar-button" aria-label="내 프로필" title={ownName}>{initials(ownName)}</button>
       </aside>
 
@@ -1203,6 +1323,46 @@ export default function Home() {
         </section>
       )}
 
+      {manageOpen && isConnected && (
+        <section className="manage-panel" aria-label="에이전트·그룹 관리">
+          <header className="thread-header">
+            <button className="thread-close" aria-label="관리 패널 닫기" onClick={() => setManageOpen(false)}>×</button>
+            <div>
+              <span className="eyebrow">MANAGE</span>
+              <h3>에이전트·그룹</h3>
+            </div>
+          </header>
+          <div className="manage-tabs">
+            <button className={`manage-tab ${manageTab === "agents" ? "active" : ""}`} onClick={() => setManageTab("agents")}>
+              에이전트 정의 <span>{personas.length}</span>
+            </button>
+            <button className={`manage-tab ${manageTab === "groups" ? "active" : ""}`} onClick={() => setManageTab("groups")}>
+              그룹 <span>{teams.length}</span>
+            </button>
+          </div>
+
+          {manageTab === "agents" ? (
+            <div className="manage-scroll">
+              <p className="manage-hint">에이전트 정의(kind:30175)의 모델/provider/runtime을 수정하면 NIP-33 교체 헤드로 발행돼요. 데스크톱/다음 스폰 시 적용됩니다.</p>
+              {personas.length === 0 && <p className="empty-channels">정의된 에이전트가 없습니다.</p>}
+              {personas.map((persona) => (
+                <PersonaEditor
+                  key={persona.slug}
+                  persona={persona}
+                  onSave={savePersona}
+                  onDelete={deletePersona}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="manage-scroll">
+              <p className="manage-hint">그룹(kind:30176)으로 에이전트 정의를 묶을 수 있어요. 팀 지시문(instructions)도 설정할 수 있습니다.</p>
+              <TeamComposer personas={personas} teams={teams} onSave={saveTeam} onDelete={deleteTeam} />
+            </div>
+          )}
+        </section>
+      )}
+
       {openThread && (
         <section className="thread-panel" aria-label="스레드">
           <header className="thread-header">
@@ -1354,5 +1514,149 @@ export default function Home() {
 
       {notice && <div className="toast" role="status"><span>i</span>{notice}<button onClick={() => setNotice("")} aria-label="알림 닫기">×</button></div>}
     </main>
+  );
+}
+
+function PersonaEditor({ persona, onSave, onDelete }: {
+  persona: Persona;
+  onSave: (persona: Persona) => boolean;
+  onDelete: (persona: Persona) => void;
+}) {
+  const [name, setName] = useState(persona.displayName);
+  const [model, setModel] = useState(persona.model ?? "");
+  const [provider, setProvider] = useState(persona.provider ?? "");
+  const [runtime, setRuntime] = useState(persona.runtime ?? "");
+  const [prompt, setPrompt] = useState(persona.systemPrompt ?? "");
+  const [dirty, setDirty] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  const markDirty = (setter: (value: string) => void, value: string) => {
+    setter(value);
+    setDirty(true);
+  };
+
+  return (
+    <div className="persona-card">
+      <button className="persona-head" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+        <span className="persona-name">{name || persona.displayName}</span>
+        <span className="persona-tags">
+          {provider && <span className="persona-tag">{provider}</span>}
+          {model && <span className="persona-tag">{model}</span>}
+          {runtime && <span className="persona-tag">{runtime}</span>}
+        </span>
+        <span className="persona-caret">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="persona-body">
+          <label className="field-label" htmlFor={`${persona.slug}-name`}>이름</label>
+          <div className="field-shell"><input id={`${persona.slug}-name`} value={name} onChange={(event) => markDirty(setName, event.target.value)} /></div>
+
+          <label className="field-label" htmlFor={`${persona.slug}-model`}>모델</label>
+          <div className="field-shell"><input id={`${persona.slug}-model`} value={model} placeholder="예: gpt-5, deepseek-v4-flash" onChange={(event) => markDirty(setModel, event.target.value)} /></div>
+
+          <label className="field-label" htmlFor={`${persona.slug}-provider`}>Provider</label>
+          <div className="field-shell"><input id={`${persona.slug}-provider`} value={provider} placeholder="예: openai, deepseek" onChange={(event) => markDirty(setProvider, event.target.value)} /></div>
+
+          <label className="field-label" htmlFor={`${persona.slug}-runtime`}>런타임</label>
+          <div className="field-shell"><input id={`${persona.slug}-runtime`} value={runtime} placeholder="예: codex, opencode, claude-code" onChange={(event) => markDirty(setRuntime, event.target.value)} /></div>
+
+          <label className="field-label" htmlFor={`${persona.slug}-prompt`}>시스템 프롬프트</label>
+          <div className="field-shell prompt"><textarea id={`${persona.slug}-prompt`} value={prompt} rows={3} placeholder="에이전트 성격/지시" onChange={(event) => markDirty(setPrompt, event.target.value)} /></div>
+
+          <div className="persona-actions">
+            <button className="persona-delete" onClick={() => onDelete(persona)}>삭제</button>
+            <button className="connect-button small persona-save" disabled={!dirty} onClick={() => {
+              if (onSave({ ...persona, displayName: name, model: model || null, provider: provider || null, runtime: runtime || null, systemPrompt: prompt || null })) {
+                setDirty(false);
+                setOpen(false);
+              }
+            }}>저장</button>
+          </div>
+          <p className="members-hint">slug: {persona.slug}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TeamComposer({ personas, teams, onSave, onDelete }: {
+  personas: Persona[];
+  teams: Team[];
+  onSave: (team: Team) => boolean;
+  onDelete: (team: Team) => void;
+}) {
+  const [draft, setDraft] = useState<Team | null>(null);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [instructions, setInstructions] = useState("");
+
+  const startNew = () => {
+    setDraft({ id: crypto.randomUUID(), name: "", description: null, instructions: null, personaIds: [], updatedAt: 0 });
+    setName("");
+    setDescription("");
+    setInstructions("");
+  };
+
+  return (
+    <div className="team-composer">
+      <button className="agent-picker-toggle" onClick={startNew}>＋ 새 그룹 만들기</button>
+      {draft && (
+        <div className="team-edit">
+          <label className="field-label" htmlFor="team-name">그룹 이름</label>
+          <div className="field-shell"><input id="team-name" value={name} placeholder="예: 코딩 팀" onChange={(event) => setName(event.target.value)} /></div>
+
+          <label className="field-label" htmlFor="team-desc">설명 (선택)</label>
+          <div className="field-shell"><input id="team-desc" value={description} placeholder="이 그룹의 용도" onChange={(event) => setDescription(event.target.value)} /></div>
+
+          <label className="field-label" htmlFor="team-instructions">지시문 (선택)</label>
+          <div className="field-shell prompt"><textarea id="team-instructions" value={instructions} rows={3} placeholder="팀 전체에 적용할 지시" onChange={(event) => setInstructions(event.target.value)} /></div>
+
+          <p className="field-label">구성원 (에이전트 정의)</p>
+          <div className="team-members">
+            {personas.map((persona) => {
+              const checked = draft.personaIds.includes(persona.slug);
+              return (
+                <label key={persona.slug} className="team-member">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => setDraft({ ...draft, personaIds: checked ? draft.personaIds.filter((id) => id !== persona.slug) : [...draft.personaIds, persona.slug] })}
+                  />
+                  <span>{persona.displayName}</span>
+                  {persona.model && <span className="persona-tag">{persona.model}</span>}
+                </label>
+              );
+            })}
+            {personas.length === 0 && <p className="members-hint">정의된 에이전트가 없어요. 먼저 에이전트 정의 탭에서 추가하세요.</p>}
+          </div>
+
+          <button className="connect-button small" disabled={!name.trim()} onClick={() => {
+            if (onSave({ ...draft, name: name.trim(), description: description || null, instructions: instructions || null })) setDraft(null);
+          }}>그룹 저장</button>
+        </div>
+      )}
+
+      <div className="team-list">
+        {teams.map((team) => (
+          <div key={team.id} className="team-row">
+            <div className="team-row-head">
+              <strong>{team.name}</strong>
+              <span className="persona-tag">{team.personaIds.length}명</span>
+              <button className="persona-delete" onClick={() => onDelete(team)}>삭제</button>
+            </div>
+            {team.description && <p className="members-hint">{team.description}</p>}
+            {team.instructions && <p className="team-instructions">📌 {team.instructions}</p>}
+            <div className="team-row-members">
+              {team.personaIds.map((slug) => {
+                const persona = personas.find((item) => item.slug === slug);
+                return <span key={slug} className="team-member-chip">{persona?.displayName || slug}</span>;
+              })}
+              {team.personaIds.length === 0 && <span className="members-hint">구성원 없음</span>}
+            </div>
+          </div>
+        ))}
+        {teams.length === 0 && <p className="empty-channels">아직 그룹이 없습니다.</p>}
+      </div>
+    </div>
   );
 }
