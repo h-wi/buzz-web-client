@@ -7,7 +7,8 @@ import {
   type Event as NostrEvent,
 } from "nostr-tools";
 import { hasStoredKey, parseSecretKey, removeStoredKey, saveKey, unlockKey } from "./keyStore";
-import { resolveMentions, segmentMentions } from "./mentions";
+import { resolveMentions } from "./mentions";
+import { renderMarkdown } from "./markdown";
 import { monotonicCreatedAt, parsePersona, parseTeam, personaContentBody, personaTags, teamContentBody, type Persona, type Team } from "./agents";
 import type { Profile } from "./profiles";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -1080,9 +1081,7 @@ export default function Home() {
                   {replyTargetId && (
                     <p className="reply-context">↩ {parentName ? `${parentName}: ${messageText(parent.content).slice(0, 80)}` : shortPubkey(replyTargetId)}</p>
                   )}
-                  <p>{segmentMentions(messageText(message.content), memberProfiles).map((segment, index) => (
-                    segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
-                  ))}</p>
+                  <div className="msg-md">{renderMarkdown(messageText(message.content), memberProfiles)}</div>
                   {(grouped.size > 0 || (isConnected && activeChannel)) && (
                     <div className="reaction-row">
                       {[...grouped.entries()].map(([emoji, pubkeys]) => (
@@ -1383,9 +1382,7 @@ export default function Home() {
               <div className={`message-avatar ${avatarTone(openThread.pubkey)}`}>{initials(visibleProfiles[openThread.pubkey]?.name || shortPubkey(openThread.pubkey))}</div>
               <div className="message-body">
                 <div className="message-meta"><strong>{visibleProfiles[openThread.pubkey]?.name || shortPubkey(openThread.pubkey)}</strong><time>{formatTime(openThread.created_at)}</time></div>
-                <p>{segmentMentions(messageText(openThread.content), memberProfiles).map((segment, index) => (
-                  segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
-                ))}</p>
+                <div className="msg-md">{renderMarkdown(messageText(openThread.content), memberProfiles)}</div>
               </div>
             </div>
 
@@ -1402,9 +1399,7 @@ export default function Home() {
                 <div className={`message-avatar ${avatarTone(reply.pubkey)}`}>{initials(visibleProfiles[reply.pubkey]?.name || shortPubkey(reply.pubkey))}</div>
                 <div className="message-body">
                   <div className="message-meta"><strong>{visibleProfiles[reply.pubkey]?.name || shortPubkey(reply.pubkey)}</strong>{visibleProfiles[reply.pubkey]?.isAgent && <span className="agent-badge">AGENT</span>}<time>{formatTime(reply.created_at)}</time></div>
-                  <p>{segmentMentions(messageText(reply.content), memberProfiles).map((segment, index) => (
-                    segment.mention ? <span key={index} className="mention-token">{segment.text}</span> : <span key={index}>{segment.text}</span>
-                  ))}</p>
+                  <div className="msg-md">{renderMarkdown(messageText(reply.content), memberProfiles)}</div>
                 </div>
               </div>
             ))}
