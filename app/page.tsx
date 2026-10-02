@@ -27,6 +27,7 @@ type Channel = {
   createdAt: number;
   isDm?: boolean;
   participants?: string[];
+  archived?: boolean;
 };
 
 type Reaction = {
@@ -81,6 +82,7 @@ function channelFromEvent(event: NostrEvent): Channel | null {
     name: findTag(event, "name") || "unnamed",
     about: findTag(event, "about") || "이 채널에는 아직 설명이 없습니다.",
     isPrivate: hasTag(event, "private"),
+    archived: findTag(event, "archived") === "true",
     createdAt: event.created_at,
   };
 }
@@ -174,6 +176,12 @@ export default function Home() {
   const [teams, setTeams] = useState<Team[]>([]);
   const [manageOpen, setManageOpen] = useState(false);
   const [manageTab, setManageTab] = useState<"agents" | "groups">("agents");
+  const [threadWidth, setThreadWidth] = useState(() => {
+    if (typeof window === "undefined") return 380;
+    const stored = Number(window.localStorage.getItem("buzz-thread-width"));
+    return Number.isFinite(stored) && stored >= 280 ? Math.min(stored, 800) : 380;
+  });
+  const threadDraggingRef = useRef(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const secretRef = useRef<Uint8Array | null>(null);
@@ -196,8 +204,36 @@ export default function Home() {
   const archivedRef = useRef<Set<string>>(new Set());
   const dmOpenCallbackRef = useRef<((reason: string, accepted: boolean) => void) | null>(null);
 
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      if (!threadDraggingRef.current) return;
+      const width = Math.min(800, Math.max(280, window.innerWidth - event.clientX));
+      setThreadWidth(width);
+    };
+    const onUp = () => {
+      if (!threadDraggingRef.current) return;
+      threadDraggingRef.current = false;
+      document.body.style.cursor = "";
+      window.localStorage.setItem("buzz-thread-width", String(threadWidth));
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [threadWidth]);
+
+  const startThreadResize = () => {
+    threadDraggingRef.current = true;
+    document.body.style.cursor = "col-resize";
+  };
+
+
   const isConnected = status === "connected";
-  const visibleChannels = isConnected ? channels : DEMO_CHANNELS;
+  const liveChannels = isConnected ? channels.filter((channel) => !channel.archived) : DEMO_CHANNELS;
+  const archivedChannels = isConnected ? channels.filter((channel) => channel.archived) : [];
+  const showArchivedChannels = isConnected && archivedChannels.length > 0;
   const dmNames = useMemo(() => {
     const map = new Map<string, string>();
     for (const dm of dms) {
@@ -364,6 +400,25 @@ export default function Home() {
       setNotice(`#${name} 채널을 만들었어요.`);
     } catch {
       setNotice("채널 생성 이벤트를 만들지 못했어요.");
+    }
+  };
+
+  const setChannelArchived = (channel: Channel, archived: boolean) => {
+    const key = secretRef.current;
+    if (!key) return;
+    try {
+      const event = finalizeEvent({
+        kind: 9002,
+        created_at: nowInSeconds(),
+        content: "",
+        tags: [["h", channel.id], ["archived", archived ? "true" : "false"]],
+      }, key);
+      sendFrame(["EVENT", event]);
+      setChannels((current) => current.map((item) => (item.id === channel.id ? { ...item, archived } : item)));
+      if (archived && activeChannel?.id === channel.id) setActiveChannel(null);
+      setNotice(archived ? `#${channel.name} 채널을 보관했어요.` : `#${channel.name} 채널 보관을 해제했어요.`);
+    } catch {
+      setNotice(archived ? "채널 보관 이벤트를 만들지 못했어요." : "채널 보관 해제 이벤트를 만들지 못했어요.");
     }
   };
 
@@ -984,7 +1039,10 @@ export default function Home() {
   }, [status]);
 
   return (
-    <main className={`app-shell ${!isConnected ? "preview-mode" : ""}`}>
+    <main
+      className={`app-shell ${!isConnected ? "preview-mode" : ""}`}
+      style={openThread && !membersOpen && !manageOpen ? { gridTemplateColumns: `72px 252px minmax(0,1fr) ${threadWidth}px` } : undefined}
+    >
       <aside className="workspace-rail" aria-label="워크스페이스">
         <div className="brand-mark" aria-label="Buzz Web">B</div>
         <div className="rail-spacer" />
@@ -1000,8 +1058,8 @@ export default function Home() {
           <span className={`status-pill ${status}`}><i /> {connectionLabel}</span>
         </div>
         <nav className="channel-nav" aria-label="채널">
-          <p className="nav-label">CHANNELS <span>{visibleChannels.length}</span>{isConnected && <button className="nav-add-button" aria-label="채널 추가" onClick={() => setCreateOpen(true)}>＋</button>}</p>
-          {visibleChannels.map((channel) => (
+          <p className="nav-label">CHANNELS <span>{liveChannels.length}</span>{isConnected && <button className="nav-add-button" aria-label="채널 추가" onClick={() => setCreateOpen(true)}>＋</button>}</p>
+          {liveChannels.map((channel) => (
             <button
               key={channel.id}
               className={`channel-link ${visibleActive?.id === channel.id ? "active" : ""}`}
@@ -1012,6 +1070,22 @@ export default function Home() {
             </button>
           ))}
           {isConnected && channels.length === 0 && <p className="empty-channels">볼 수 있는 채널이 없습니다.</p>}
+          {showArchivedChannels && (
+            <>
+              <p className="nav-label">ARCHIVED <span>{archivedChannels.length}</span></p>
+              {archivedChannels.map((channel) => (
+                <button
+                  key={channel.id}
+                  className="channel-link archived"
+                  onClick={() => setChannelArchived(channel, false)}
+                  title="보관 해제"
+                  disabled={!isConnected}
+                >
+                  <span className="hash">🗂</span><span className="channel-name">{channel.name}</span>
+                </button>
+              ))}
+            </>
+          )}
         </nav>
         {isConnected && (
           <nav className="channel-nav dm-nav" aria-label="다이렉트 메시지">
@@ -1045,6 +1119,13 @@ export default function Home() {
           </div>
           <div className="header-actions">
             {isConnected && <span className="member-count"><i className="member-dot one" /><i className="member-dot two" /><i className="member-dot three" /> {memberCount || "—"}</span>}
+            {isConnected && visibleActive && !visibleActive.isDm && (
+              <button
+                aria-label={visibleActive.archived ? "채널 보관 해제" : "채널 보관"}
+                title={visibleActive.archived ? "보관 해제" : "채널 보관"}
+                onClick={() => setChannelArchived(visibleActive, !visibleActive.archived)}
+              >🗂</button>
+            )}
             <button aria-label="채널 멤버" onClick={() => setMembersOpen((value) => !value)}>•••</button>
           </div>
         </header>
@@ -1364,6 +1445,7 @@ export default function Home() {
 
       {openThread && (
         <section className="thread-panel" aria-label="스레드">
+          <button className="thread-resize-handle" aria-label="스레드 너비 조절" onMouseDown={startThreadResize} onDoubleClick={() => setThreadWidth(380)} />
           <header className="thread-header">
             <button className="thread-close" aria-label="스레드 닫기" onClick={() => setOpenThreadId("")}>×</button>
             <div>
